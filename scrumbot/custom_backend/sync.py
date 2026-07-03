@@ -1,35 +1,42 @@
+"""Two-way synchronisation between Discord and the DevOps board.
+
+* **Discord -> DevOps** is handled by the agent's ``devops_*`` tools: a user asks
+  the bot to create/update work and the agent calls the REST API.
+* **DevOps -> Discord** is handled by the webhook receiver (``scrumbot.webhooks``),
+  which renders an inbound event with :meth:`SyncCoordinator.format_event` and
+  announces it in the notify channel.
+
+This module holds the (pure, easily-tested) rendering logic for that second
+direction.
+"""
+from __future__ import annotations
+
 from typing import Any, Dict
 
 
-class DiscordLPSync:
-    """
-    Two-way synchronization logic between Discord and DevOpsBackend.
-    
-    This class is currently a stub. It is intended to handle the
-    synchronization of messages, threads, and states between 
-    Discord channels/threads and DevOpsBackend resources (like tasks and epics).
-    """
-    
-    def __init__(self) -> None:
-        """Initialize the sync coordinator."""
-        pass
-        
-    async def sync_discord_to_lp(self, data: Dict[str, Any]) -> None:
+class SyncCoordinator:
+    """Renders DevOps board events into Discord-friendly messages."""
+
+    @staticmethod
+    def format_event(payload: Dict[str, Any]) -> str:
+        """Turn a webhook payload into a concise Discord message.
+
+        Defensive about shape: the backend may nest the node under ``node`` or
+        ``data`` and use different key names, so we probe a few common ones.
         """
-        Sync changes from Discord to DevOpsBackend.
-        
-        Args:
-            data (Dict[str, Any]): The payload containing Discord changes.
-        """
-        # TODO: Implement synchronization logic from Discord to LP
-        pass
-        
-    async def sync_devops_to_discord(self, data: Dict[str, Any]) -> None:
-        """
-        Sync changes from DevOpsBackend to Discord.
-        
-        Args:
-            data (Dict[str, Any]): The payload containing DevOpsBackend changes.
-        """
-        # TODO: Implement synchronization logic from LP to Discord
-        pass
+        event = payload.get("event") or payload.get("type") or "update"
+        node = payload.get("node") or payload.get("data") or payload
+        title = (
+            node.get("title")
+            or node.get("name")
+            or node.get("subject")
+            or node.get("id")
+            or "an item"
+        )
+
+        parts = [f"**DevOps {event}** — {title}"]
+        if status := node.get("status"):
+            parts.append(f"status: `{status}`")
+        if actor := (payload.get("actor") or node.get("assignee")):
+            parts.append(f"by {actor}")
+        return " · ".join(parts)
