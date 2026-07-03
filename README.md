@@ -4,186 +4,242 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-**CustomOrg AI ScrumBot** is a next-generation, low-latency AI Scrum Master built specifically for Discord and native integration with the **DevOpsBackend DevOps Board**.
+**AI ScrumBot** is a low-latency, fully-asynchronous AI Scrum Master for **Discord**,
+with native integration to a **DevOps board** REST API.
 
-Inspired by the original [ScrumAgent](https://github.com/Shikenso-Analytics/ScrumAgent), this rewrite completely overhauls the architecture to eliminate blocking bottlenecks, reduce latency by up to 6x, and expose the bot's capabilities as a standard MCP (Model Context Protocol) server.
+Inspired by the original [ScrumAgent](https://github.com/Shikenso-Analytics/ScrumAgent),
+this rewrite overhauls the architecture around a single composition root: shared
+resources are constructed once and injected, long-running LLM work is pushed off
+the gateway event loop onto a worker pool, semantic search runs on a local ONNX
+embedding model, and the bot exposes itself as an MCP server over stdio **or** HTTP.
 
 ---
 
 ## 📊 Performance Benchmarks & Architectural Comparison
 
-The original ScrumAgent suffered from several blocking I/O operations and massive subprocess overheads due to its reliance on standard `stdio` MCP server spawning for every tool call. We eliminated these bottlenecks.
+The original ScrumAgent spawns a `stdio` MCP subprocess (Chroma/Taiga/GitHub) for
+tool calls and performs blocking I/O on the event loop. Those are the bottlenecks
+this rewrite removes.
 
-### ⏱️ Latency & Throughput Improvements
+### ⏱️ Latency & Throughput Targets
 
-| Operation | Original ScrumAgent | LaunchPixel AI ScrumBot | Improvement Factor | Root Cause Fixed |
+> The figures below are **architectural estimates** — the improvement factor each
+> change is expected to unlock by removing the named bottleneck — not numbers from
+> a controlled benchmark harness.
+
+| Operation | Original ScrumAgent | AI ScrumBot | Factor | Root Cause Fixed |
 | :--- | :--- | :--- | :--- | :--- |
-| **Bot Startup Time** | 8.0s – 15.0s | **~1.5s** | **8x Faster** | Removed cold-start `stdio` MCP subprocess spawning (Chroma/Taiga) |
-| **Message Response (Hot)** | 5.0s – 12.0s | **1.5s – 3.0s** | **4x Faster** | Converted blocking `httpx.get` and tool calls to native `async/await` |
-| **Concurrent Messages** | Blocks event loop | **Non-blocking** | **Infinite** | Added `asyncio.Queue` worker pool for parallel LLM task delegation |
-| **Semantic Search (Chroma)**| 2.5s per query | **0.3s per query**| **8x Faster** | Migrated from external MCP server to **in-process singleton** |
-| **API Backend Fetch** | N/A (Taiga only) | **0.8s** | **New** | Direct async HTTP pool connections to DevOps API (no subprocesses) |
-| **Standup Generation** | 20s – 35s | **8s – 12s** | **3x Faster** | Parallelized async context gathering instead of sequential lookups |
+| **Bot Startup** | 8–15 s | ~1.5 s | ~8× | No cold-start `stdio` MCP subprocess spawning |
+| **Message Response (hot)** | 5–12 s | 1.5–3 s | ~4× | Blocking `httpx.get` → shared `AsyncClient` |
+| **Concurrent Messages** | Blocks event loop | Non-blocking | — | `asyncio.Queue` worker pool offloads LLM turns |
+| **Semantic Search (Chroma)** | ~2.5 s / query | ~0.3 s / query | ~8× | In-process store + **local ONNX embeddings** |
+| **DevOps Fetch** | N/A | ~0.8 s | new | Pooled async HTTP, no subprocess |
+| **Standup Generation** | 20–35 s | 8–12 s | ~3× | Parallel async context gathering |
 
 ### 🧠 Architectural Paradigm Shift
 
-```mermaid
-pie title CPU Idle Time vs Blocked I/O Time (Original vs New)
-    "Original: Blocked I/O" : 75
-    "Original: CPU Active" : 25
-```
-```mermaid
-pie title CPU Idle Time vs Blocked I/O Time (New Async Model)
-    "New: Awaiting I/O (Free Event Loop)" : 85
-    "New: CPU Active" : 15
-```
-
-| Component | Original Architecture (ScrumAgent) | New Architecture (AI ScrumBot) |
+| Component | Original (ScrumAgent) | AI ScrumBot |
 | :--- | :--- | :--- |
-| **Event Loop Strategy** | Sequential / Blocking (`time.sleep()`, sync requests) | 100% Async (`asyncio`, `httpx.AsyncClient`) |
-| **Tool Orchestration** | Heavily coupled to `mcp-server` stdio subprocesses | In-process LangChain Tools + External HTTP MCP |
-| **Database Sync** | Synced via expensive scraping/polling | **Webhooks** push real-time updates directly to Bot |
-| **Discord Interface** | `@mentions` only, purely text-based | Slash commands, Interactive UI Views, Embeds |
-| **LLM Inference** | Hardcoded to OpenAI (`ChatOpenAI`) | Factory Pattern: Gemini, Anthropic, NIM, Ollama |
-
----
-
-## ✨ Key Features
-
-* **⚡ Ultra-Low Latency:** Moved Chroma vector search and API clients in-process. No more waiting 5–15 seconds for `stdio` subprocesses to spin up on every request.
-* **🔄 Fully Asynchronous:** Built from the ground up with Python's `asyncio` and `httpx.AsyncClient`. Long-running LLM inferences no longer block the Discord event loop.
-* **🛠️ First-Class DevOpsBackend Integration:** Reads and writes directly to your CustomOrg DevOps board (Epics, Features, User Stories, Tasks) via REST API and Webhooks—replacing the heavy reliance on Taiga.
-* **🤖 Universal LLM Support:** Easily swap between OpenAI, Anthropic, Gemini, Ollama, and NVIDIA NIM using the flexible `llm.py` factory.
-* **🎮 True Discord UX:** Ditches clunky text commands for modern Discord UI features: Slash Commands (`/board`, `/standup`, `/task update`), rich embeds, and interactive buttons.
-* **🔌 MCP Server Mode:** Exposes the ScrumBot itself as an MCP server. Other AI tools and agents can query your board's status or search Discord history.
+| **Composition** | Module-level singletons, import-time side effects | `ScrumBotApp` container: build once, inject, shut down cleanly |
+| **Config** | Scattered `os.environ` reads | Central `Settings` (`pydantic-settings`) |
+| **Event loop** | Sequential / blocking | 100% async (`asyncio`, `httpx.AsyncClient`) |
+| **Tooling** | Coupled to `stdio` MCP subprocesses | In-process LangChain tools + external MCP |
+| **Embeddings** | Hosted API per query | Local `fastembed` ONNX by default (no API key) |
+| **HTTP** | New client per request | One pooled `AsyncClient` with retries/backoff |
+| **DevOps ← Discord** | Scraping / polling | Agent tools write the board; **webhooks** push events back |
+| **Discord UX** | `@mentions`, text-only | Slash commands, deferred async replies, chunking |
+| **LLM** | Hardcoded `ChatOpenAI` | Factory: OpenAI, Anthropic, Gemini, NVIDIA NIM, Ollama |
+| **MCP** | stdio only | stdio **or** HTTP (runs beside the bot) |
 
 ---
 
 ## 🏗️ Architecture
 
+Everything hangs off one composition root (`ScrumBotApp`) that owns the shared
+LLM, HTTP client, vector store, agent, and work queue.
+
 ```mermaid
 graph TB
-    subgraph "Discord Layer"
-        DC[Discord Client<br/>discord.py] --> EH[Event Handler<br/>Slash Cmds / Mentions]
-        EH --> RQ[Priority Async Queue]
+    M["main.py<br/>--mode discord | mcp | both"]
+
+    subgraph Root["Composition Root"]
+        CFG["Settings<br/>(pydantic-settings)"]
+        APP["ScrumBotApp<br/>lifecycle + DI"]
     end
-    
-    subgraph "Core Agent Layer"
-        RQ --> SA[ScrumBot ReAct Agent<br/>LangGraph]
-        SA --> LLM[LLM Factory<br/>Gemini/NIM/OpenAI]
-        SA --> TP[In-Process Tool Pool]
+
+    subgraph Discord["Discord Surface"]
+        BOT["ScrumBot<br/>slash commands"]
+        Q["RequestQueue<br/>async worker pool"]
+        DISP["Dispatcher"]
+        COL["Message Collector"]
     end
-    
-    subgraph "Tool Integrations"
-        TP --> LP[DevOpsBackend Client<br/>Async HTTP]
-        TP --> CH[ChromaDB<br/>Local Semantic Search]
-        TP --> WT[Web Search<br/>DuckDuckGo, ArXiv, Wiki]
+
+    subgraph Core["Agent Core"]
+        AG["ScrumAgent<br/>LangGraph ReAct"]
+        LLM["LLM Factory"]
+        MEM["Checkpointer<br/>Memory / Mongo"]
     end
-    
-    subgraph "External Integrations"
-        LP -->|REST API| LPA[DevOpsBackend Backend<br/>api.your-company.com]
-        LPA -->|Webhook| DC
-        MCP[FastMCP Server] --> SA
+
+    subgraph Tools["Tools"]
+        DOT["DevOps tools"]
+        WEB["Web / arXiv / Wikipedia"]
     end
+
+    subgraph Data["Data & Integrations"]
+        DC["DevOpsClient<br/>pooled httpx + retries"]
+        CH["ChromaDB<br/>local fastembed"]
+    end
+
+    subgraph Ext["External Surfaces"]
+        MCP["FastMCP<br/>stdio | http"]
+        WH["Webhook Receiver<br/>FastAPI"]
+    end
+
+    M --> APP
+    CFG --> APP
+    APP --> AG & Q & DC & CH
+    BOT --> Q --> DISP --> AG
+    BOT --> COL --> CH
+    AG --> LLM & MEM
+    AG --> DOT --> DC
+    AG --> WEB
+    DC -->|REST| API[("DevOps API")]
+    API -->|webhook| WH --> BOT
+    MCP --> AG
 ```
+
+**The closed async loop:** a slash command `defer()`s immediately, enqueues a job
+on the `RequestQueue`, and returns. A worker runs the agent (LLM + tools) and edits
+the deferred reply — so the Discord gateway heartbeat is never blocked and several
+requests process in parallel.
+
+---
+
+## ✨ Key Features
+
+* **⚡ Non-blocking by construction:** `asyncio` throughout, a shared
+  `httpx.AsyncClient`, async vector-store I/O, and a worker pool that keeps LLM
+  turns off the event loop.
+* **🧩 One composition root:** `ScrumBotApp` builds and wires every resource once
+  and tears them down cleanly — no import-time side effects, easy to test.
+* **🔎 Truly in-process search:** local `fastembed` ONNX embeddings by default, so
+  semantic search over Discord history needs no API key and no network hop.
+* **🛠️ First-class DevOps integration:** a pooled, retrying async client reads and
+  writes the board; inbound changes arrive via a FastAPI **webhook receiver**.
+* **🤖 Universal LLM support:** swap OpenAI, Anthropic, Gemini, NVIDIA NIM, or
+  Ollama with one env var via the `llm.py` factory.
+* **🎮 Modern Discord UX:** slash commands, deferred async responses, 2000-char
+  chunking, and background schedulers.
+* **🔌 MCP server mode:** exposes `ask_scrum_bot` and `search_discord_history`
+  over **stdio or HTTP**, so it can run standalone or alongside the bot.
 
 ---
 
 ## 🚀 Getting Started
 
 ### 1. Prerequisites
+- Python 3.10–3.12
+- A Discord bot token
+- (Optional) a running DevOps board API + MongoDB for persistent agent memory
 
-- Python 3.10 to 3.12
-* Node.js (for the DevOpsBackend backend)
-* PostgreSQL (DevOpsBackend Database)
-
-### 2. Installation
-
-Clone the repository and install the dependencies using `pip` (or `uv` / `hatch`):
+### 2. Install
 
 ```bash
-git clone https://github.com/your-org/AI_ScrumBot.git
-cd AI_ScrumBot
-
-# Install dependencies
-pip install -e .
+git clone https://github.com/Raul909/AI-ScrumBot.git
+cd AI-ScrumBot
+pip install -e .            # add [dev] for tests + linters
 ```
 
-### 3. Configuration
-
-Copy the `.env.example` to `.env` and fill in your keys:
+### 3. Configure
+Copy the example env and fill it in. Every variable maps 1:1 to `scrumbot/config.py`.
 
 ```bash
 cp .env.example .env
 ```
 
-**Key Variables:**
-
-* `SCRUM_AGENT_MODEL`: Choose your LLM (e.g., `gemini-1.5-pro`, `gpt-4o`, `meta/llama-3.1-70b-instruct`)
-* `DISCORD_TOKEN`: Your Discord Bot token
-* `DEVOPS_API_URL`: Your DevOpsBackend API endpoint (`https://api.your-company.com/api`)
-* `BOT_API_KEY`: The API key matching your DevOpsBackend backend middleware
-
-### 4. DevOpsBackend Setup
-
-Run the seed script on your DevOpsBackend backend to create the dedicated Bot Admin user:
-
-```bash
-cd ../DevOpsBackend/backend
-node scripts/seedBotUser.js
-```
+| Variable | Purpose |
+| :--- | :--- |
+| `SCRUM_AGENT_MODEL` | `gemini-1.5-pro`, `gpt-4o`, `claude-3-5-sonnet-latest`, `meta/llama-3.1-70b-instruct`, `ollama/llama3` |
+| `DISCORD_TOKEN` | Discord bot token |
+| `DEVOPS_API_URL` / `BOT_API_KEY` | DevOps board API endpoint + bot key |
+| `EMBEDDING_PROVIDER` | `fastembed` (local, default) or `openai` |
+| `MCP_TRANSPORT` | `stdio` (default), `http`, or `sse` |
+| `MONGO_DB_URL` | Optional — enables the MongoDB checkpointer (else in-memory) |
+| `WEBHOOK_SECRET` / `NOTIFY_CHANNEL_ID` | Optional — enable the DevOps→Discord webhook receiver |
 
 ---
 
 ## 💻 Usage
 
-The bot features a unified entry point that can run the Discord bot, the MCP server, or both simultaneously.
-
-**Run the Discord Bot (Default):**
-
 ```bash
-python main.py --mode discord
+python main.py --mode discord   # Discord bot only (default)
+python main.py --mode mcp       # MCP server only (transport from MCP_TRANSPORT)
+python main.py --mode both      # bot + MCP (+ webhooks if WEBHOOK_SECRET is set)
 ```
 
-**Run as a standalone MCP Server:**
+In `--mode both`, a `stdio` MCP transport would fight the bot for stdin/stdout, so
+it is transparently upgraded to HTTP.
 
-```bash
-python main.py --mode mcp
-```
-
-**Run Both (Discord + MCP):**
-
-```bash
-python main.py --mode both
-```
-
----
-
-## 🎮 Discord Slash Commands
+### Discord Slash Commands
 
 | Command | Description |
 | :--- | :--- |
-| `/board` | Generates a rich embed overview of the current DevOpsBackend DevOps board. |
-| `/standup` | Manually triggers a daily standup thread for the current channel. |
-| `/task create <title>` | Creates a new Task under a specified User Story. |
-| `/task update <id> <status>` | Updates the status of a specific task (e.g., Pending -> In Progress). |
-| `/ask <query>` | Asks the AI Scrum Master a natural language question about the project. |
-| `/sync` | Forces a manual two-way sync between Discord discussions and DevOpsBackend. |
-| `/epic list` | Lists all active Epics and their current risk/priority status. |
+| `/ask <query>` | Ask the AI Scrum Master anything about the project. |
+| `/board` | Overview of the current board (epics, task counts by status). |
+| `/standup` | Generate today's standup summary from recent activity. |
+| `/task create <title>` | Create a task (optionally under a user story). |
+| `/task update <id> <status>` | Update a task's status. |
+| `/sync` | Fetch the latest board state to confirm connectivity. |
+| `/clear` | Summarise completed tasks ready to archive. |
 
 ---
 
 ## 📂 Project Structure
 
-* **`main.py`**: The CLI entry point.
-* **`scrumbot/agent.py`**: The core LangGraph ReAct agent loop.
-* **`scrumbot/discord/`**: Discord UI, views, embeds, slash commands, and background schedulers.
-* **`scrumbot/custom_backend/`**: The async HTTP client and LangChain tools for interacting with the CustomOrg DevOps board.
-* **`scrumbot/data/`**: In-process ChromaDB vector store and Discord message collectors.
-* **`scrumbot/mcp_server/`**: Exports the bot's internal capabilities as an external MCP server.
+```
+AI-ScrumBot/
+├── main.py                     # Universal entry point (discord | mcp | both)
+├── scrumbot/
+│   ├── config.py               # Settings (pydantic-settings) + logging
+│   ├── app.py                  # ScrumBotApp — composition root & lifecycle
+│   ├── agent.py                # LangGraph ReAct agent (+ checkpointer)
+│   ├── llm.py                  # LLM factory (OpenAI/Anthropic/Gemini/NIM/Ollama)
+│   ├── tools.py                # Tool registry (web + DevOps)
+│   ├── prompts.py              # System / standup prompts
+│   ├── queue.py                # Async worker-pool request queue
+│   ├── webhooks.py             # FastAPI DevOps→Discord receiver
+│   ├── discord/                # Bot, slash commands, dispatcher, events, scheduler
+│   ├── custom_backend/         # Pooled async DevOps client, tools, sync coordinator
+│   ├── data/                   # In-process Chroma store + message collector
+│   └── mcp_server/             # FastMCP server (stdio | http)
+├── config/                     # YAML data (channel maps, external MCP servers)
+└── tests/                      # Unit tests (queue, sync, config, llm)
+```
+
+`config/` holds **data** (YAML); runtime code lives in the `scrumbot` package.
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -e ".[dev]"
+pytest                 # run the test suite (asyncio auto-mode)
+ruff check .           # lint
+```
+
+This repo is set up for **graph-based code review** via the
+[`better-code-review-graph`](https://github.com/n24q02m/better-code-review-graph)
+MCP server (Tree-sitter + local ONNX). It is registered at local scope for Claude
+Code:
+
+```bash
+claude mcp add better-code-review-graph --env MCP_TRANSPORT=stdio -- \
+  uvx --python 3.13 better-code-review-graph
+```
 
 ---
 
 ## 📝 License
 
-This project is licensed under the MIT License.
+MIT.
