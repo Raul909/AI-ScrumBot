@@ -1,6 +1,11 @@
+"""Discord bot.
+
+Slash commands defer immediately and enqueue the real work onto the shared
+async queue; a worker runs the agent and edits the deferred response. Nothing
+blocks the gateway event loop.
 """
-Main bot setup and command registration.
-"""
+from __future__ import annotations
+
 import logging
 from typing import Optional
 
@@ -8,97 +13,93 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from scrumbot.app import ScrumBotApp
+from scrumbot.discord.dispatcher import Dispatcher
 
-# Mock queue for tasks
-class MockQueue:
-    """A mock request queue for central processing."""
-    
-    async def put(self, item: dict) -> None:
-        logging.info(f"Enqueued: {item}")
-
-
-request_queue = MockQueue()
+logger = logging.getLogger(__name__)
 
 
 class ScrumCommands(commands.Cog):
-    """Slash commands for ScrumBot."""
+    """Slash commands for ScrumBot. Each defers, then enqueues a dispatcher job."""
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot: "ScrumBot") -> None:
         self.bot = bot
 
+    @property
+    def _queue(self):
+        return self.bot.app.queue
+
+    @property
+    def _dispatch(self) -> Dispatcher:
+        return self.bot.dispatcher
+
     @app_commands.command(name="ask", description="Ask the Scrum Master a question.")
-    async def ask(self, interaction: discord.Interaction, question: str):
-        await interaction.response.defer()
-        await request_queue.put({"type": "ask", "user": interaction.user.id, "question": question})
-        await interaction.followup.send(f"Thinking about: '{question}'...")
+    async def ask(self, interaction: discord.Interaction, question: str) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(self._dispatch.handle_ask, interaction, question)
 
     @app_commands.command(name="board", description="View the current agile board.")
-    async def board(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        await request_queue.put({"type": "board", "user": interaction.user.id})
-        await interaction.followup.send("Fetching the board...")
+    async def board(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(self._dispatch.handle_board, interaction)
 
-    @app_commands.command(name="standup", description="Start or view the daily standup.")
-    async def standup(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        await request_queue.put({"type": "standup", "user": interaction.user.id})
-        await interaction.followup.send("Checking standup status...")
+    @app_commands.command(name="standup", description="Generate the daily standup summary.")
+    async def standup(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(self._dispatch.handle_standup, interaction)
 
     task_group = app_commands.Group(name="task", description="Task management commands.")
 
     @task_group.command(name="update", description="Update a task's status.")
-    async def task_update(self, interaction: discord.Interaction, task_id: str, status: str):
-        await interaction.response.defer()
-        await request_queue.put({
-            "type": "task_update",
-            "user": interaction.user.id,
-            "task_id": task_id,
-            "status": status
-        })
-        await interaction.followup.send(f"Updating task {task_id} to {status}...")
+    async def task_update(
+        self, interaction: discord.Interaction, task_id: str, status: str
+    ) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(
+            self._dispatch.handle_task_update, interaction, task_id, status
+        )
 
     @task_group.command(name="create", description="Create a new task.")
-    async def task_create(self, interaction: discord.Interaction, title: str, description: Optional[str] = None):
-        await interaction.response.defer()
-        await request_queue.put({
-            "type": "task_create",
-            "user": interaction.user.id,
-            "title": title,
-            "description": description
-        })
-        await interaction.followup.send(f"Creating task '{title}'...")
+    async def task_create(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: Optional[str] = None,
+    ) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(
+            self._dispatch.handle_task_create, interaction, title, description
+        )
 
     @app_commands.command(name="sync", description="Sync board with external trackers.")
-    async def sync(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        await request_queue.put({"type": "sync", "user": interaction.user.id})
-        await interaction.followup.send("Syncing board...")
+    async def sync(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(self._dispatch.handle_sync, interaction)
 
-    @app_commands.command(name="clear", description="Clear completed tasks from the board.")
-    async def clear(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        await request_queue.put({"type": "clear", "user": interaction.user.id})
-        await interaction.followup.send("Clearing completed tasks...")
+    @app_commands.command(name="clear", description="Summarise completed tasks to clear.")
+    async def clear(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        await self._queue.enqueue(self._dispatch.handle_clear, interaction)
 
 
 class ScrumBot(commands.Bot):
-    """The main Discord bot class for ScrumBot."""
+    """The Discord bot, bound to a started :class:`ScrumBotApp`."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, app: ScrumBotApp, *args, **kwargs) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         intents.messages = True
-        super().__init__(command_prefix="!", intents=intents, *args, **kwargs)
+        super().__init__(*args, command_prefix="!", intents=intents, **kwargs)
+        self.app = app
+        self.dispatcher = Dispatcher(app)
 
     async def setup_hook(self) -> None:
-        """Setup tasks to run before the bot starts."""
-        from .events import setup_events
-        from .scheduler import setup_scheduler
-        
+        from scrumbot.discord.events import setup_events
+        from scrumbot.discord.scheduler import setup_scheduler
+
         setup_events(self)
         await setup_scheduler(self)
-
         await self.add_cog(ScrumCommands(self))
         await self.tree.sync()
-        logging.info("ScrumBot setup complete.")
+        logger.info("ScrumBot setup complete.")
