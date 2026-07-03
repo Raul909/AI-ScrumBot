@@ -228,16 +228,6 @@ pytest                 # run the test suite (asyncio auto-mode)
 ruff check .           # lint
 ```
 
-This repo is set up for **graph-based code review** via the
-[`better-code-review-graph`](https://github.com/n24q02m/better-code-review-graph)
-MCP server (Tree-sitter + local ONNX). It is registered at local scope for Claude
-Code:
-
-```bash
-claude mcp add better-code-review-graph --env MCP_TRANSPORT=stdio -- \
-  uvx --python 3.13 better-code-review-graph
-```
-
 ---
 
 ## 📝 License

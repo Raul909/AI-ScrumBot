@@ -24,6 +24,11 @@ chroma_db/
 .ruff_cache/
 .mypy_cache/
 
+# Claude Code / local tooling config
+.claude/
+.claude.json
+.mcp.json
+
 # OS / editor
 .DS_Store
 .idea/
